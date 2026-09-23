@@ -1,212 +1,675 @@
 'use client';
 
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { MarkdownReader, getMarkdownHeadings, openHeadingSection } from '@/components/MarkdownReader';
-import { sampleMarkdown } from '@/lib/sample';
+import { MarkdownReader, countChecks, getMarkdownHeadings, openHeadingSection } from '@/components/MarkdownReader';
+import Rail, { NoteRows, RAIL_NARROW, RAIL_WIDE, filterNotes } from '@/components/Rail';
+import Editor from '@/components/Editor';
+import Sheet from '@/components/Sheet';
+import SettingsPanel from '@/components/SettingsPanel';
+import Icon from '@/components/Icon';
+import MarkdMark from '@/components/notebook/MarkdMark';
+import HandNote from '@/components/notebook/HandNote';
+import HandCheck from '@/components/notebook/HandCheck';
+import { CheckStrokes, MinutesLeft, TocList } from '@/components/Contents';
+import {
+  ACTIVE_KEY, DOCS_KEY, checksKey, dateLabel, downloadNote, draftKey, loadChecks, loadNotes, minutesFor,
+  readStore, removeStore, scrollKey, titleFromMarkdown, wordCount, writeStore, type CheckResult, type Note,
+} from '@/lib/notes';
+import { applyPrefs, readPrefs, writePrefs, type Prefs } from '@/lib/prefs';
 
-type Document = { id: string; title: string; markdown: string; updatedAt: number };
-type FontSize = 'small' | 'medium' | 'large';
-type Theme = 'paper' | 'night';
+type Mode = 'read' | 'edit';
+type SheetName = 'notes' | 'contents' | 'page' | null;
+type Notice = { id: number; text: string; action?: { label: string; run: () => void } };
 
-const DOCS_KEY = 'markd:documents:v1';
-const ACTIVE_KEY = 'markd:active:v1';
-const FONT_KEY = 'markd:font:v1';
-const THEME_KEY = 'markd:theme:v1';
-const scrollKey = (id: string) => `markd:scroll:${id}`;
-
-function readStore(key: string) { try { return localStorage.getItem(key); } catch { return null; } }
-function writeStore(key: string, value: string) { try { localStorage.setItem(key, value); } catch { /* Storage can be disabled or full. */ } }
-function removeStore(key: string) { try { localStorage.removeItem(key); } catch { /* Keep the reader usable. */ } }
-function titleFromMarkdown(markdown: string) {
-  const title = markdown.match(/^#\s+(.+)$/m)?.[1]?.trim();
-  return title || `Untitled · ${new Date().toLocaleDateString()}`;
-}
-function dateLabel(timestamp: number) { return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }); }
-function Icon({ name }: { name: 'file' | 'plus' | 'edit' | 'book' | 'sun' | 'moon' | 'upload' | 'trash' | 'menu' }) {
-  const paths: Record<typeof name, React.ReactNode> = {
-    file: <><path d="M6 2.5h7l5 5V21H6z"/><path d="M13 2.5V8h5M9 12h6M9 16h6"/></>,
-    plus: <path d="M12 5v14M5 12h14"/>,
-    edit: <><path d="M4 20h4l11-11-4-4L4 16zM13 7l4 4"/></>,
-    book: <><path d="M4 4.5h7a3 3 0 0 1 3 3V20H7a3 3 0 0 0-3 1zM20 4.5h-3a3 3 0 0 0-3 3V20h3a3 3 0 0 1 3 1z"/></>,
-    sun: <><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></>,
-    moon: <path d="M20.4 15.3A8.5 8.5 0 0 1 8.7 3.6 8.5 8.5 0 1 0 20.4 15.3z"/>,
-    upload: <><path d="M12 16V3m-4 4 4-4 4 4M4 15v5h16v-5"/></>,
-    trash: <><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7M10 11v6m4-6v6"/></>,
-    menu: <path d="M4 7h16M4 12h16M4 17h16"/>,
-  };
-  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
-}
+const RAIL_KEY = 'markd:rail:collapsed';
+const newId = () => (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `n-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+const isTyping = (target: EventTarget | null) =>
+  target instanceof HTMLElement && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
+const looksLikeMarkdownFile = (file: File) => /\.(md|markdown|mdown|txt)$/i.test(file.name) || /^text\//.test(file.type);
 
 export default function Home() {
-  const [documents, setDocuments] = useState<Document[]>([]);
+  const [notes, setNotes] = useState<Note[]>([]);
   const [activeId, setActiveId] = useState('');
-  const [mode, setMode] = useState<'read' | 'edit'>('read');
+  const [mode, setMode] = useState<Mode>('read');
   const [draft, setDraft] = useState('');
-  const [fontSize, setFontSize] = useState<FontSize>('medium');
-  const [theme, setTheme] = useState<Theme>('paper');
+  const [editingNew, setEditingNew] = useState(false);
+  const [prefs, setPrefs] = useState<Prefs>({ tone: 'paper', toneAuto: true, font: 'fraunces', size: 'medium', measure: 'narrow' });
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [activeHeading, setActiveHeading] = useState('');
   const [progress, setProgress] = useState(0);
-  const [mobileLibrary, setMobileLibrary] = useState(false);
+  const [railCollapsed, setRailCollapsed] = useState(false);
+  const [sheet, setSheet] = useState<SheetName>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const [checks, setChecks] = useState<Record<string, CheckResult>>({});
+  const [mobileQuery, setMobileQuery] = useState('');
   const [ready, setReady] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
-  const restoreRef = useRef<number | null>(null);
-  const editingNewRef = useRef(false);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const originalDraft = useRef('');
 
+  const say = useCallback((text: string, action?: Notice['action']) => setNotice({ id: Date.now(), text, action }), []);
+
+  /* ── Load ─────────────────────────────────────────────────────────── */
   useEffect(() => {
-    let saved: Document[] | null = null;
+    const saved = loadNotes();
+    const initialPrefs = readPrefs();
+    const initialActive = saved.find((n) => n.id === readStore(ACTIVE_KEY))?.id || saved[0]?.id || '';
+    let pending: { target: string; text: string } | null = null;
     try {
-      const raw = readStore(DOCS_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) saved = parsed.filter((item) => typeof item?.id === 'string' && typeof item?.markdown === 'string' && typeof item?.title === 'string');
-      }
-    } catch { /* Corrupt storage falls back to the sample. */ }
-    if (!saved) {
-      saved = [{ id: 'sample', title: titleFromMarkdown(sampleMarkdown), markdown: sampleMarkdown, updatedAt: Date.now() }];
-      writeStore(DOCS_KEY, JSON.stringify(saved));
+      pending = JSON.parse(readStore(draftKey) || 'null');
+    } catch {
+      pending = null;
     }
-    const storedFont = readStore(FONT_KEY);
-    const storedTheme = readStore(THEME_KEY);
-    const initialDocuments = saved;
-    const initialActive = saved.find((item) => item.id === readStore(ACTIVE_KEY))?.id || saved[0]?.id || '';
-    const initialTheme = storedTheme === 'paper' || storedTheme === 'night' ? storedTheme : window.matchMedia('(prefers-color-scheme: dark)').matches ? 'night' : 'paper';
-    const frame = window.requestAnimationFrame(() => {
-      setDocuments(initialDocuments);
+    const frame = requestAnimationFrame(() => {
+      setNotes(saved);
       setActiveId(initialActive);
-      if (storedFont === 'small' || storedFont === 'medium' || storedFont === 'large') setFontSize(storedFont);
-      setTheme(initialTheme);
+      setPrefs(initialPrefs);
+      setRailCollapsed(readStore(RAIL_KEY) === 'true');
+      if (pending?.text?.trim()) {
+        const target = saved.find((n) => n.id === pending.target);
+        setEditingNew(!target);
+        if (target) setActiveId(target.id);
+        originalDraft.current = target?.markdown ?? '';
+        setDraft(pending.text);
+        setMode('edit');
+        setNotice({ id: Date.now(), text: 'Picked up the draft you left open.' });
+      }
       setReady(true);
     });
-    return () => window.cancelAnimationFrame(frame);
+    return () => cancelAnimationFrame(frame);
   }, []);
 
-  useEffect(() => { if (ready) writeStore(DOCS_KEY, JSON.stringify(documents)); }, [documents, ready]);
+  useEffect(() => { if (ready) writeStore(DOCS_KEY, JSON.stringify(notes)); }, [notes, ready]);
   useEffect(() => { if (ready) writeStore(ACTIVE_KEY, activeId); }, [activeId, ready]);
-  useEffect(() => { document.documentElement.dataset.theme = theme; }, [theme]);
+  useEffect(() => { if (ready) applyPrefs(prefs); }, [prefs, ready]);
   useEffect(() => {
-    if (readStore(THEME_KEY)) return;
+    document.documentElement.style.setProperty('--rail', `${railCollapsed ? RAIL_NARROW : RAIL_WIDE}px`);
+  }, [railCollapsed]);
+
+  // Follow the system paper until one is picked.
+  useEffect(() => {
+    if (!prefs.toneAuto) return;
     const media = window.matchMedia('(prefers-color-scheme: dark)');
-    const onChange = () => setTheme(media.matches ? 'night' : 'paper');
-    media.addEventListener('change', onChange);
-    return () => media.removeEventListener('change', onChange);
-  }, []);
+    const sync = () => setPrefs((p) => ({ ...p, tone: media.matches ? 'night' : 'paper' }));
+    sync();
+    media.addEventListener('change', sync);
+    return () => media.removeEventListener('change', sync);
+  }, [prefs.toneAuto]);
 
-  const activeDoc = documents.find((item) => item.id === activeId);
-  const headings = useMemo(() => getMarkdownHeadings(activeDoc?.markdown || ''), [activeDoc?.markdown]);
+  const updatePrefs = (patch: Partial<Prefs>) =>
+    setPrefs((current) => {
+      const next = { ...current, ...patch };
+      if (patch.toneAuto) next.tone = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'night' : 'paper';
+      writePrefs(next);
+      return next;
+    });
 
+  const collapseRail = (next: boolean) => {
+    setRailCollapsed(next);
+    writeStore(RAIL_KEY, String(next));
+  };
+
+  /* ── Active note ──────────────────────────────────────────────────── */
+  const active = notes.find((n) => n.id === activeId);
+  const markdown = active?.markdown ?? '';
+  const headings = useMemo(() => getMarkdownHeadings(markdown), [markdown]);
+  const words = useMemo(() => wordCount(markdown), [markdown]);
+  const totalChecks = useMemo(() => countChecks(markdown), [markdown]);
+  const hasOwnTitle = /^\s*#\s+/.test(markdown.replace(/^\s*---[\s\S]*?---\s*/, ''));
+  const minutes = minutesFor(words);
+  const minutesLeft = Math.round(minutes * (1 - progress));
+  const activeIndex = notes.findIndex((n) => n.id === activeId);
+  const nextNote = activeIndex >= 0 ? notes[activeIndex + 1] ?? (notes.length > 1 ? notes[0] : undefined) : undefined;
+
+  useEffect(() => {
+    if (!activeId) return;
+    const frame = requestAnimationFrame(() => setChecks(loadChecks(activeId)));
+    return () => cancelAnimationFrame(frame);
+  }, [activeId]);
+
+  const markCheck = useCallback((id: string, result: CheckResult) => {
+    setChecks((current) => {
+      const next = { ...current };
+      if (next[id] === result) delete next[id];
+      else next[id] = result;
+      writeStore(checksKey(activeId), JSON.stringify(next));
+      return next;
+    });
+  }, [activeId]);
+
+  const rememberScroll = useCallback(() => {
+    if (mode === 'read' && activeId) writeStore(scrollKey(activeId), String(window.scrollY));
+  }, [mode, activeId]);
+
+  // Put the reader back where they left the note.
   useEffect(() => {
     if (!ready || mode !== 'read' || !activeId) return;
     const y = Number(readStore(scrollKey(activeId)) || 0);
-    restoreRef.current = window.setTimeout(() => window.scrollTo({ top: Number.isFinite(y) ? y : 0, behavior: 'instant' }), 90);
-    return () => { if (restoreRef.current !== null) window.clearTimeout(restoreRef.current); };
+    const timer = window.setTimeout(() => window.scrollTo({ top: Number.isFinite(y) ? y : 0, behavior: 'instant' }), 60);
+    return () => window.clearTimeout(timer);
   }, [activeId, mode, ready]);
 
   useEffect(() => {
     if (mode !== 'read') return;
     let timer: number | undefined;
-    const update = () => {
+    let frame = 0;
+    const measure = () => {
+      frame = 0;
       const scrollable = document.documentElement.scrollHeight - window.innerHeight;
-      setProgress(scrollable > 0 ? Math.min(100, Math.max(0, window.scrollY / scrollable * 100)) : 100);
-      const threshold = 145;
+      setProgress(scrollable > 0 ? Math.min(1, Math.max(0, window.scrollY / scrollable)) : 1);
       let current = headings[0]?.id || '';
       for (const heading of headings) {
         const el = document.getElementById(heading.id);
-        if (el && el.getClientRects().length && el.getBoundingClientRect().top <= threshold) current = heading.id;
+        if (el && el.getClientRects().length && el.getBoundingClientRect().top <= 120) current = heading.id;
       }
+      // The last section can be too short to ever reach the top.
+      if (scrollable > 0 && window.scrollY >= scrollable - 4 && headings.length) current = headings[headings.length - 1].id;
       setActiveHeading(current);
+    };
+    const onScroll = () => {
+      if (!frame) frame = requestAnimationFrame(measure);
       if (activeId) {
         window.clearTimeout(timer);
-        timer = window.setTimeout(() => writeStore(scrollKey(activeId), String(window.scrollY)), 180);
+        timer = window.setTimeout(() => writeStore(scrollKey(activeId), String(window.scrollY)), 200);
       }
     };
-    window.addEventListener('scroll', update, { passive: true });
-    window.addEventListener('resize', update);
-    update();
-    return () => { window.removeEventListener('scroll', update); window.removeEventListener('resize', update); window.clearTimeout(timer); };
-  }, [headings, activeId, mode]);
+    window.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onScroll);
+    onScroll();
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', onScroll);
+      window.clearTimeout(timer);
+      cancelAnimationFrame(frame);
+    };
+  }, [headings, activeId, mode, collapsed]);
 
-  const openEditor = useCallback((fresh = false) => {
-    if (mode === 'read' && activeId) writeStore(scrollKey(activeId), String(window.scrollY));
-    setDraft(fresh ? '' : activeDoc?.markdown || '');
+  // Keep the tab title on the note.
+  useEffect(() => {
+    document.title = mode === 'edit' ? `Writing · Markd` : active ? `${active.title} · Markd` : 'Markd';
+  }, [active, mode]);
+
+  /* ── Draft autosave ───────────────────────────────────────────────── */
+  useEffect(() => {
+    if (!ready || mode !== 'edit') return;
+    const timer = window.setTimeout(() => {
+      if (draft.trim() && draft !== originalDraft.current) writeStore(draftKey, JSON.stringify({ target: editingNew ? 'new' : activeId, text: draft }));
+      else removeStore(draftKey);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [draft, mode, ready, editingNew, activeId]);
+
+  /* ── Actions ──────────────────────────────────────────────────────── */
+  const openEditor = useCallback((fresh: boolean, seed?: string) => {
+    rememberScroll();
+    const text = seed ?? (fresh ? '' : active?.markdown ?? '');
+    originalDraft.current = fresh ? '' : active?.markdown ?? '';
+    setDraft(text);
+    setEditingNew(fresh || !active);
     setMode('edit');
-    setMobileLibrary(false);
-    window.scrollTo(0, 0);
-  }, [activeDoc?.markdown, activeId, mode]);
+    setSheet(null);
+    window.scrollTo({ top: 0, behavior: 'instant' });
+  }, [active, rememberScroll]);
+
+  const startNew = useCallback(() => openEditor(true), [openEditor]);
+  const startEdit = useCallback(() => openEditor(!active), [openEditor, active]);
 
   const saveDraft = useCallback(() => {
     if (!draft.trim()) return;
-    const title = titleFromMarkdown(draft);
-    // An edit updates the opened document; a fresh note receives a new id.
-    const finalId = editingNewRef.current ? crypto.randomUUID() : activeDoc?.id || crypto.randomUUID();
-    const next: Document = { id: finalId, title, markdown: draft, updatedAt: Date.now() };
-    setDocuments((previous) => [next, ...previous.filter((item) => item.id !== finalId)]);
-    setActiveId(finalId);
+    const id = editingNew || !active ? newId() : active.id;
+    const now = Date.now();
+    const next: Note = { id, title: titleFromMarkdown(draft), markdown: draft, updatedAt: now, createdAt: active && !editingNew ? active.createdAt : now };
+    setNotes((previous) => [next, ...previous.filter((n) => n.id !== id)]);
+    setActiveId(id);
     setCollapsed(new Set());
-    writeStore(scrollKey(finalId), '0');
-    editingNewRef.current = false;
+    if (editingNew) writeStore(scrollKey(id), '0');
+    removeStore(draftKey);
+    setEditingNew(false);
     setMode('read');
-    window.scrollTo(0, 0);
-  }, [activeDoc, draft]);
-  const startNew = () => { editingNewRef.current = true; openEditor(true); };
-  const startEdit = () => { editingNewRef.current = false; openEditor(); };
+  }, [active, draft, editingNew]);
 
-  const openFile = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    try {
-      if (mode === 'read' && activeId) writeStore(scrollKey(activeId), String(window.scrollY));
-      const markdown = await file.text();
-      const next: Document = { id: crypto.randomUUID(), title: titleFromMarkdown(markdown), markdown, updatedAt: Date.now() };
-      setDocuments((previous) => [next, ...previous]);
-      setActiveId(next.id);
-      setCollapsed(new Set());
-      setMode('read');
-      setMobileLibrary(false);
-      window.scrollTo(0, 0);
-    } catch { /* A failed read leaves the current document available. */ }
+  const cancelEdit = useCallback(() => {
+    const kept = draft;
+    const wasNew = editingNew;
+    removeStore(draftKey);
+    setMode('read');
+    setEditingNew(false);
+    if (kept.trim() && kept !== originalDraft.current) {
+      say('Changes set aside.', { label: 'Bring back', run: () => (wasNew ? openEditor(true, kept) : openEditor(false, kept)) });
+    }
+  }, [draft, editingNew, openEditor, say]);
+
+  const addNotes = useCallback((incoming: Note[]) => {
+    if (!incoming.length) return;
+    rememberScroll();
+    setNotes((previous) => [...incoming, ...previous]);
+    setActiveId(incoming[0].id);
+    setCollapsed(new Set());
+    setMode('read');
+    setSheet(null);
+    window.scrollTo({ top: 0, behavior: 'instant' });
+    say(incoming.length === 1 ? `Opened “${incoming[0].title}”.` : `Opened ${incoming.length} notes.`);
+  }, [rememberScroll, say]);
+
+  const importFiles = useCallback(async (files: File[]) => {
+    const usable = files.filter(looksLikeMarkdownFile);
+    if (!usable.length) {
+      if (files.length) say('That doesn’t look like a markdown file.');
+      return;
+    }
+    const read = await Promise.all(usable.map(async (file) => {
+      try {
+        const text = await file.text();
+        const now = Date.now();
+        const fallback = file.name.replace(/\.[^.]+$/, '');
+        return { id: newId(), title: /^#\s+/m.test(text) ? titleFromMarkdown(text) : fallback, markdown: text, updatedAt: now, createdAt: now };
+      } catch {
+        return null;
+      }
+    }));
+    addNotes(read.filter((n): n is NonNullable<typeof n> => n !== null));
+  }, [addNotes, say]);
+
+  const onFileInput = async (event: ChangeEvent<HTMLInputElement>) => {
+    await importFiles(Array.from(event.target.files ?? []));
     event.target.value = '';
   };
-  const deleteDocument = (id: string) => {
-    const next = documents.filter((item) => item.id !== id);
-    setDocuments(next);
-    if (activeId === id) { setActiveId(next[0]?.id || ''); setMode('read'); setCollapsed(new Set()); }
-    removeStore(scrollKey(id));
-  };
-  const selectDocument = (id: string) => {
-    if (mode === 'read' && activeId) writeStore(scrollKey(activeId), String(window.scrollY));
-    setActiveId(id); setMode('read'); setMobileLibrary(false); setCollapsed(new Set());
-  };
-  const jumpTo = (id: string) => {
-    openHeadingSection(id);
-    window.requestAnimationFrame(() => {
-      const el = document.getElementById(id);
-      if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); setActiveHeading(id); }
+
+  const deleteNote = useCallback((id: string) => {
+    const index = notes.findIndex((n) => n.id === id);
+    const gone = notes[index];
+    if (!gone) return;
+    const rest = notes.filter((n) => n.id !== id);
+    setNotes(rest);
+    if (activeId === id) {
+      setActiveId(rest[Math.min(index, rest.length - 1)]?.id || '');
+      setMode('read');
+      setCollapsed(new Set());
+    }
+    say(`Deleted “${gone.title}”.`, {
+      label: 'Undo',
+      run: () => {
+        setNotes((current) => {
+          const copy = current.filter((n) => n.id !== gone.id);
+          copy.splice(Math.min(index, copy.length), 0, gone);
+          return copy;
+        });
+        setActiveId(gone.id);
+      },
     });
+  }, [notes, activeId, say]);
+
+  const selectNote = useCallback((id: string) => {
+    rememberScroll();
+    setActiveId(id);
+    setMode('read');
+    setSheet(null);
+    setCollapsed(new Set());
+    setMobileQuery('');
+  }, [rememberScroll]);
+
+  const jumpTo = (id: string) => {
+    setSheet(null);
+    openHeadingSection(id);
+    setActiveHeading(id);
   };
-  const toggleSection = (id: string) => setCollapsed((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
-  const toggleTheme = () => { const next = theme === 'paper' ? 'night' : 'paper'; setTheme(next); writeStore(THEME_KEY, next); };
-  const changeFont = (size: FontSize) => { setFontSize(size); writeStore(FONT_KEY, size); };
 
-  const library = <>
-    <div className="rail-top"><span className="eyebrow">Your notes</span><button className="button icon-button" title="New note" aria-label="New note" onClick={startNew}><Icon name="plus" /></button></div>
-    <div className="doc-list">{documents.length === 0 ? <div className="empty-state">Your saved notes will appear here.</div> : documents.map((doc) => <div key={doc.id} className={`doc-item ${doc.id === activeId ? 'active' : ''}`}><Icon name="file"/><div className="doc-item-content" role="button" tabIndex={0} onClick={() => selectDocument(doc.id)} onKeyDown={(event) => { if (event.key === 'Enter') selectDocument(doc.id); }}><span className="doc-item-title">{doc.title}</span><span className="doc-item-date">{dateLabel(doc.updatedAt)}</span></div><button className="delete-button" aria-label={`Delete ${doc.title}`} title="Delete note" onClick={() => deleteDocument(doc.id)}><Icon name="trash"/></button></div>)}</div>
-  </>;
+  const toggleSection = (id: string) =>
+    setCollapsed((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const sectionIds = headings.filter((h) => h.level === 2).map((h) => h.id);
+  const allFolded = sectionIds.length > 0 && sectionIds.every((id) => collapsed.has(id));
+  const foldAll = () => setCollapsed(allFolded ? new Set() : new Set(sectionIds));
 
-  return <>
-    <input ref={fileRef} type="file" accept=".md,.markdown,text/markdown,text/plain" hidden onChange={openFile} />
-    <header className="app-header"><div className="progress-track"><div className="progress-fill" style={{ width: mode === 'read' ? `${progress}%` : '0%' }} /></div><div className="header-inner">
-      <div className="brand"><span className="brand-mark">m</span> markd</div><div className="header-separator"/><span className="header-doc-title">{activeDoc?.title || 'Your reading desk'}</span>
-      <div className="header-actions">
-        <button className="button icon-button mobile-library" style={{ display: 'none' }} aria-label="Saved notes" title="Saved notes" onClick={() => setMobileLibrary(!mobileLibrary)}><Icon name="menu"/></button>
-        <button className="button" onClick={() => fileRef.current?.click()} title="Open .md file"><Icon name="upload"/><span className="button-label">Open .md</span></button>
-        <button className="button icon-button" onClick={toggleTheme} aria-label={theme === 'paper' ? 'Switch to dark mode' : 'Switch to light mode'} title={theme === 'paper' ? 'Dark mode' : 'Light mode'}><Icon name={theme === 'paper' ? 'moon' : 'sun'}/></button>
-        {mode === 'read' ? <button className="button button-primary" onClick={startEdit}><Icon name="edit"/><span className="button-label">Edit note</span></button> : <button className="button button-primary" onClick={saveDraft} disabled={!draft.trim()}><Icon name="book"/><span className="button-label">Read note</span></button>}
+  const copyMarkdown = async () => {
+    if (!active) return;
+    try {
+      await navigator.clipboard.writeText(active.markdown);
+      say('Markdown copied.');
+    } catch {
+      say('Couldn’t reach the clipboard.');
+    }
+  };
+
+  /* ── Keys, paste and drop ─────────────────────────────────────────── */
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const mod = event.metaKey || event.ctrlKey;
+      if (mode === 'edit') {
+        if (mod && event.key.toLowerCase() === 's') {
+          event.preventDefault();
+          saveDraft();
+        } else if (event.key === 'Escape' && !sheet) {
+          event.preventDefault();
+          cancelEdit();
+        }
+        return;
+      }
+      if (mod || event.altKey || isTyping(event.target) || sheet) return;
+      if (event.key === 'e' && active) { event.preventDefault(); startEdit(); }
+      else if (event.key === 'n') { event.preventDefault(); startNew(); }
+      else if (event.key === 'o') { event.preventDefault(); fileRef.current?.click(); }
+      else if (event.key === '/') {
+        if (searchRef.current && searchRef.current.offsetParent) { event.preventDefault(); searchRef.current.focus(); }
+        else if (window.innerWidth < 768) { event.preventDefault(); setSheet('notes'); }
+      } else if (event.key === '[' || event.key === ']') {
+        if (notes.length < 2) return;
+        const step = event.key === ']' ? 1 : -1;
+        const to = notes[(activeIndex + step + notes.length) % notes.length];
+        if (to) selectNote(to.id);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [mode, sheet, active, activeIndex, notes, saveDraft, cancelEdit, startEdit, startNew, selectNote]);
+
+  // Pasting markdown straight onto the page makes a note of it.
+  useEffect(() => {
+    const onPaste = (event: ClipboardEvent) => {
+      if (mode !== 'read' || isTyping(event.target) || sheet) return;
+      const text = event.clipboardData?.getData('text/plain') ?? '';
+      if (text.trim().length < 20) return;
+      event.preventDefault();
+      const now = Date.now();
+      const note = { id: newId(), title: titleFromMarkdown(text), markdown: text, updatedAt: now, createdAt: now };
+      addNotes([note]);
+      say('Pasted as a new note.', { label: 'Undo', run: () => deleteNoteSilently(note.id) });
+    };
+    const deleteNoteSilently = (id: string) => setNotes((current) => {
+      const rest = current.filter((n) => n.id !== id);
+      setActiveId((a) => (a === id ? rest[0]?.id ?? '' : a));
+      return rest;
+    });
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, [mode, sheet, addNotes, say]);
+
+  useEffect(() => {
+    let depth = 0;
+    const hasFiles = (event: DragEvent) => Array.from(event.dataTransfer?.types ?? []).includes('Files');
+    const onEnter = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      depth++;
+      setDragging(true);
+    };
+    const onOver = (event: DragEvent) => { if (hasFiles(event)) event.preventDefault(); };
+    const onLeave = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      depth = Math.max(0, depth - 1);
+      if (!depth) setDragging(false);
+    };
+    const onDrop = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      depth = 0;
+      setDragging(false);
+      void importFiles(Array.from(event.dataTransfer?.files ?? []));
+    };
+    window.addEventListener('dragenter', onEnter);
+    window.addEventListener('dragover', onOver);
+    window.addEventListener('dragleave', onLeave);
+    window.addEventListener('drop', onDrop);
+    return () => {
+      window.removeEventListener('dragenter', onEnter);
+      window.removeEventListener('dragover', onOver);
+      window.removeEventListener('dragleave', onLeave);
+      window.removeEventListener('drop', onDrop);
+    };
+  }, [importFiles]);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), notice.action ? 6000 : 3200);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  /* ── Render ───────────────────────────────────────────────────────── */
+  const showToc = mode === 'read' && !!active && (headings.length > 0 || totalChecks > 0);
+
+  const phoneTop = (
+    <div className="phone-top">
+      <span className="wordmark"><MarkdMark size={18} /><span>Markd</span></span>
+      <button type="button" className="btn btn-ghost btn-icon" onClick={() => fileRef.current?.click()} aria-label="Open a markdown file">
+        <Icon name="upload" size={17} />
+      </button>
+    </div>
+  );
+
+  let body: React.ReactNode = null;
+  if (!ready) body = null;
+  else if (mode === 'edit') {
+    body = (
+      <div className="page-main">
+        {phoneTop}
+        <Editor
+          draft={draft}
+          onChange={setDraft}
+          isNew={editingNew}
+          title={draft.trim() ? titleFromMarkdown(draft) : active?.title ?? 'Untitled'}
+          onSave={saveDraft}
+          onCancel={cancelEdit}
+          onOpenFile={() => fileRef.current?.click()}
+        />
       </div>
-    </div></header>
-    {mobileLibrary && <div className="mobile-library" style={{ display: 'none', borderBottom: '1px solid var(--line)', padding: '20px' }}>{library}</div>}
-    <div className="app-layout"><aside className="left-rail"><div className="rail-sticky">{library}</div></aside><main className="reader-main"><div className="reader-column">
-      {mode === 'edit' ? <><div className="reading-meta"><span className="eyebrow">Edit note</span><span className="meta-line"/></div><h1 className="reader-title">Your reading desk.</h1><p className="reader-subtitle">Paste your markdown below, then choose Read note.</p><div className="editor-label eyebrow">Markdown</div><textarea className="paste-area" value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={'# Your note title\n\nPaste your study notes here…'} autoFocus/><div className="editor-footer"><button className="button" onClick={() => fileRef.current?.click()}><Icon name="upload"/>Open .md file</button><button className="button button-primary" disabled={!draft.trim()} onClick={saveDraft}>Read note</button></div></> : activeDoc ? <><div className="reading-meta"><span className="eyebrow">Study notes</span><span className="meta-line"/><span className="eyebrow">{dateLabel(activeDoc.updatedAt)}</span></div><div className="mobile-toc">{headings.length > 0 && <><label className="eyebrow" htmlFor="mobile-toc">On this page</label><select id="mobile-toc" value={activeHeading} onChange={(event) => jumpTo(event.target.value)}><option value="">Jump to section</option>{headings.map((heading) => <option key={heading.id} value={heading.id}>{heading.level === 3 ? '　' : ''}{heading.text}</option>)}</select></>}<div className="mobile-size"><span className="eyebrow">Text size</span><div className="segmented" role="group" aria-label="Text size">{(['small', 'medium', 'large'] as const).map((size) => <button key={size} className={fontSize === size ? 'selected' : ''} onClick={() => changeFont(size)} aria-pressed={fontSize === size}>{size === 'medium' ? 'Default' : size[0].toUpperCase() + size.slice(1)}</button>)}</div></div></div><div className={`reading-size-${fontSize}`}><MarkdownReader markdown={activeDoc.markdown} collapsedSections={collapsed} onToggleSection={toggleSection}/></div></> : <><div className="reading-meta"><span className="eyebrow">Study notes</span><span className="meta-line"/></div><h1 className="reader-title">A quieter place to read.</h1><p className="reader-subtitle">Paste markdown or open a file to begin.</p><button className="button button-primary" onClick={startNew}><Icon name="plus"/>New note</button></>}
-    </div></main><aside className="right-rail"><div className="rail-sticky">{mode === 'read' && headings.length > 0 && <><div className="eyebrow" style={{ paddingLeft: 13 }}>On this page</div><nav className="toc-list" aria-label="Table of contents">{headings.map((heading) => <button key={heading.id} className={`toc-link level-${heading.level} ${activeHeading === heading.id ? 'active' : ''}`} onClick={() => jumpTo(heading.id)}>{heading.text}</button>)}</nav></>}<div className="reader-settings"><div className="eyebrow">Text size</div><div className="segmented" role="group" aria-label="Text size">{(['small', 'medium', 'large'] as const).map((size) => <button key={size} className={fontSize === size ? 'selected' : ''} onClick={() => changeFont(size)} aria-pressed={fontSize === size}>{size === 'medium' ? 'Default' : size[0].toUpperCase() + size.slice(1)}</button>)}</div></div></div></aside></div>
-  </>;
+    );
+  } else if (!active) {
+    body = (
+      <div className="page-main desk">
+        {phoneTop}
+        <p className="standfirst">{new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' })}</p>
+        <h1 className="screen-title">A quiet place to read.</h1>
+        <p className="lede">
+          Paste your study notes, open a <span className="hl-swipe">.md</span> file, or drop one anywhere on the page. Everything stays in this browser.
+        </p>
+        <div className="row">
+          <button type="button" className="btn btn-primary" onClick={startNew}><Icon name="write" size={16} />New note</button>
+          <button type="button" className="btn btn-dashed" onClick={() => fileRef.current?.click()}><Icon name="upload" size={16} />Open .md</button>
+          <HandNote rotate={-4} size={19} style={{ marginLeft: 8 }}>or just paste</HandNote>
+        </div>
+        <div className="keys" aria-label="Keyboard shortcuts">
+          <div><span className="kbd">N</span> new note</div>
+          <div><span className="kbd">O</span> open a file</div>
+          <div><span className="kbd">Ctrl V</span> paste markdown as a note</div>
+        </div>
+      </div>
+    );
+  } else {
+    body = (
+      <>
+        <div className="page-main">
+          {phoneTop}
+          <header className="page-head">
+            <p className="standfirst">
+              Edited {dateLabel(active.updatedAt)} · {words.toLocaleString()} words · {minutes} min read
+            </p>
+            <div className="actions">
+              <button type="button" className="btn btn-ghost" onClick={startEdit} title="Edit (E)">
+                <Icon name="write" size={16} />Edit
+              </button>
+              {sectionIds.length > 1 && (
+                <button type="button" className="btn btn-ghost btn-icon" onClick={foldAll} aria-label={allFolded ? 'Open every section' : 'Fold every section'} title={allFolded ? 'Open every section' : 'Fold every section'}>
+                  <Icon name={allFolded ? 'unfold' : 'fold'} size={16} />
+                </button>
+              )}
+              <button type="button" className="btn btn-ghost btn-icon" onClick={copyMarkdown} aria-label="Copy markdown" title="Copy markdown">
+                <Icon name="copy" size={16} />
+              </button>
+              <button type="button" className="btn btn-ghost btn-icon" onClick={() => downloadNote(active)} aria-label="Download .md" title="Download .md">
+                <Icon name="download" size={16} />
+              </button>
+            </div>
+          </header>
+          {!hasOwnTitle && <h1 className="screen-title" style={{ marginBottom: 28 }}>{active.title}</h1>}
+          <div className={`reading-size-${prefs.size}`}>
+            <MarkdownReader
+              key={active.id}
+              markdown={active.markdown}
+              collapsedSections={collapsed}
+              onToggleSection={toggleSection}
+              checks={checks}
+              onMarkCheck={markCheck}
+            />
+          </div>
+          <footer className="note-end">
+            <HandCheck size={22} />
+            <HandNote size={20} rotate={-2}>that’s the lot</HandNote>
+            {nextNote && nextNote.id !== active.id && (
+              <p className="next">
+                Next on the pile:{' '}
+                <button type="button" className="btn btn-ghost" style={{ height: 32, fontStyle: 'normal' }} onClick={() => selectNote(nextNote.id)}>
+                  {nextNote.title} →
+                </button>
+              </p>
+            )}
+            <div className="row">
+              <button type="button" className="btn btn-ghost" onClick={() => window.scrollTo({ top: 0 })}>Back to the top</button>
+            </div>
+          </footer>
+        </div>
+        {showToc && (
+          <aside className="toc-col" aria-label="On this page">
+            <div className="toc-sticky">
+              {headings.length > 0 && (
+                <div className="toc-block">
+                  <span className="eyebrow">On this page</span>
+                  <TocList headings={headings} activeId={activeHeading} onJump={jumpTo} />
+                  <MinutesLeft minutes={minutesLeft} progress={progress} />
+                </div>
+              )}
+              {totalChecks > 0 && (
+                <div className="toc-block">
+                  <CheckStrokes total={totalChecks} checks={checks} />
+                </div>
+              )}
+            </div>
+          </aside>
+        )}
+      </>
+    );
+  }
+
+  const mobileNotes = filterNotes(notes, mobileQuery);
+
+  return (
+    <>
+      <span className="paper-noise" aria-hidden />
+      <input ref={fileRef} type="file" accept=".md,.markdown,.mdown,.txt,text/markdown,text/plain" multiple hidden onChange={onFileInput} />
+
+      {ready && (
+        <Rail
+          ref={searchRef}
+          collapsed={railCollapsed}
+          onCollapse={collapseRail}
+          notes={notes}
+          activeId={activeId}
+          mode={mode}
+          onSelect={selectNote}
+          onDelete={deleteNote}
+          onNew={startNew}
+          onEdit={startEdit}
+          onRead={() => (mode === 'edit' ? cancelEdit() : window.scrollTo({ top: 0 }))}
+          onOpenFile={() => fileRef.current?.click()}
+          prefs={prefs}
+          onPrefs={updatePrefs}
+        />
+      )}
+
+      <div className="frame">
+        <main className={`page ${showToc ? 'has-toc' : ''}`} data-measure={prefs.measure}>
+          {body}
+        </main>
+      </div>
+
+      {ready && (
+        <nav className="phone-bar" aria-label="Reader">
+          <div className="phone-bar-inner">
+            <button type="button" className={`phone-tab ${sheet === 'notes' ? 'is-on' : ''}`} onClick={() => setSheet('notes')}>
+              <Icon name="notes" size={20} />Notes
+            </button>
+            <button type="button" className={`phone-tab ${sheet === 'contents' ? 'is-on' : ''}`} onClick={() => setSheet('contents')} disabled={!showToc}>
+              <Icon name="contents" size={20} />Contents
+            </button>
+            {mode === 'edit' ? (
+              <button type="button" className="phone-tab is-on" onClick={saveDraft} disabled={!draft.trim()}>
+                <Icon name="read" size={20} />Save
+              </button>
+            ) : (
+              <button type="button" className="phone-tab" onClick={startEdit}>
+                <Icon name="write" size={20} />{active ? 'Edit' : 'Write'}
+              </button>
+            )}
+            <button type="button" className={`phone-tab ${sheet === 'page' ? 'is-on' : ''}`} onClick={() => setSheet('page')}>
+              <Icon name="settings" size={20} />Page
+            </button>
+          </div>
+        </nav>
+      )}
+
+      {sheet === 'notes' && (
+        <Sheet title="Notes" onClose={() => setSheet(null)}>
+          {notes.length > 3 && (
+            <label className="rail-search" style={{ marginBottom: 10 }}>
+              <Icon name="search" size={14} />
+              <span className="sr-only">Search notes</span>
+              <input value={mobileQuery} onChange={(event) => setMobileQuery(event.target.value)} placeholder="Search" style={{ background: 'var(--bg-tint)' }} />
+            </label>
+          )}
+          <NoteRows notes={mobileNotes} activeId={activeId} onSelect={selectNote} onDelete={deleteNote} />
+          {notes.length === 0 && <p className="rail-empty">Nothing here yet.</p>}
+          <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
+            <button type="button" className="btn btn-primary" style={{ flex: 1 }} onClick={startNew}><Icon name="plus" size={16} />New note</button>
+            <button type="button" className="btn btn-dashed" style={{ flex: 1 }} onClick={() => fileRef.current?.click()}><Icon name="upload" size={16} />Open .md</button>
+          </div>
+        </Sheet>
+      )}
+      {sheet === 'contents' && (
+        <Sheet title="On this page" onClose={() => setSheet(null)}>
+          <TocList headings={headings} activeId={activeHeading} onJump={jumpTo} />
+          {sectionIds.length > 1 && (
+            <div className="toc-tools">
+              <button type="button" onClick={foldAll}>{allFolded ? 'Open every section' : 'Fold every section'}</button>
+            </div>
+          )}
+          <MinutesLeft minutes={minutesLeft} progress={progress} />
+          {totalChecks > 0 && (
+            <div style={{ marginTop: 22, paddingTop: 18, borderTop: '1px solid var(--line-soft)' }}>
+              <CheckStrokes total={totalChecks} checks={checks} />
+            </div>
+          )}
+        </Sheet>
+      )}
+      {sheet === 'page' && (
+        <Sheet title="Page" onClose={() => setSheet(null)}>
+          <SettingsPanel prefs={prefs} onPrefs={updatePrefs} />
+        </Sheet>
+      )}
+
+      {notice && (
+        <div className="notice-wrap" role="status" aria-live="polite">
+          <div className="notice" key={notice.id}>
+            <span>{notice.text}</span>
+            {notice.action && (
+              <button type="button" onClick={() => { notice.action?.run(); setNotice(null); }}>{notice.action.label}</button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {dragging && (
+        <div className="drop-veil" aria-hidden>
+          <div>
+            <Icon name="upload" size={22} />
+            <strong>Drop to open</strong>
+            <span className="standfirst" style={{ margin: 0 }}>.md, .markdown or .txt</span>
+          </div>
+        </div>
+      )}
+    </>
+  );
 }
