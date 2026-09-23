@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import type { CheckResult } from "@/lib/notes";
 
 type AstNode = {
   type: string;
@@ -62,6 +63,7 @@ export function openHeadingSection(id: string) {
 function remarkReader(headings: MarkdownHeading[]) {
   return () => (tree: AstNode) => {
     let headingIndex = 0;
+    let checkIndex = 0;
     const walk = (node: AstNode) => {
       if (node.type === "heading" && (node.depth === 2 || node.depth === 3)) {
         const match = headings[headingIndex++];
@@ -77,7 +79,8 @@ function remarkReader(headings: MarkdownHeading[]) {
           firstText.value = (firstText.value ?? "").slice(match[0].length);
           if (!firstText.value) first.children?.shift();
           if (!first.children?.length) node.children.shift();
-          node.data = { ...node.data, hProperties: { ...node.data?.hProperties, "data-callout": kind } };
+          const extra: Record<string, string> = kind === "CHECK" ? { "data-check": String(checkIndex++) } : {};
+          node.data = { ...node.data, hProperties: { ...node.data?.hProperties, "data-callout": kind, ...extra } };
         }
       }
 
@@ -120,45 +123,102 @@ function remarkReader(headings: MarkdownHeading[]) {
   };
 }
 
-const callouts: Record<string, { label: string; icon: string; tone: string }> = {
-  DEF: { label: "Definition", icon: "◈", tone: "blue" },
-  EXAMPLE: { label: "Example", icon: "✦", tone: "green" },
-  EXAM: { label: "Exam tip", icon: "✳", tone: "amber" },
-  TRAP: { label: "Common mistake", icon: "!", tone: "red" },
-  SOURCE: { label: "Source", icon: "↗", tone: "purple" },
-  CHECK: { label: "Check yourself", icon: "?", tone: "grey" },
-  STEPS: { label: "Step by step", icon: "≡", tone: "teal" },
-  ARGUMENT: { label: "Argument", icon: "⇄", tone: "indigo" },
+/** Callout kinds, each drawn in one of Akada's pastels. */
+export const CALLOUTS: Record<string, { label: string; tone: string }> = {
+  DEF: { label: "Definition", tone: "sky" },
+  EXAMPLE: { label: "Example", tone: "sage" },
+  EXAM: { label: "Exam tip", tone: "butter" },
+  TRAP: { label: "Common mistake", tone: "rose" },
+  SOURCE: { label: "Source", tone: "lav" },
+  CHECK: { label: "Check yourself", tone: "slate" },
+  STEPS: { label: "Step by step", tone: "mint" },
+  ARGUMENT: { label: "Argument", tone: "mauve" },
+  NOTE: { label: "Note", tone: "sky" },
+  TIP: { label: "Tip", tone: "sage" },
+  WARNING: { label: "Careful", tone: "peach" },
+  IMPORTANT: { label: "Important", tone: "clay" },
 };
 
-function Callout({ kind, children }: { kind: string; children: React.ReactNode }) {
+function CheckCallout({ index, children }: { index: number; children: React.ReactNode }) {
+  const { checks, onMarkCheck } = useContext(ReaderContext);
+  const result = checks[String(index)];
   const [revealed, setRevealed] = useState(false);
-  const info = callouts[kind] ?? { label: kind, icon: "•", tone: "grey" };
+  const open = revealed || Boolean(result);
   return (
-    <aside className={`md-callout md-callout-${info.tone}`} data-kind={kind}>
-      <div className="md-callout-head">
-        <span className="md-callout-icon" aria-hidden="true">{info.icon}</span>
-        <span>{info.label}</span>
-      </div>
-      {kind === "CHECK" && !revealed ? (
-        <button className="md-check-button" type="button" onClick={() => setRevealed(true)}>Show</button>
+    <>
+      {open ? (
+        <div className="md-callout-content">{children}</div>
       ) : (
-        <div className="md-callout-content">
-          {children}
-          {kind === "CHECK" && <button className="md-check-button" type="button" onClick={() => setRevealed(false)}>Hide</button>}
-        </div>
+        <p className="md-check-prompt">Try it in your head first.</p>
+      )}
+      <div className="md-check-actions">
+        {!open ? (
+          <button className="md-ghost" type="button" onClick={() => setRevealed(true)}>Show answer</button>
+        ) : (
+          <>
+            <button
+              type="button"
+              className={`md-ghost ${result === "got" ? "is-picked" : ""}`}
+              aria-pressed={result === "got"}
+              onClick={() => onMarkCheck(String(index), "got")}
+            >
+              Got it
+            </button>
+            <button
+              type="button"
+              className={`md-ghost ${result === "miss" ? "is-picked is-miss" : ""}`}
+              aria-pressed={result === "miss"}
+              onClick={() => onMarkCheck(String(index), "miss")}
+            >
+              Not yet
+            </button>
+            {!result && (
+              <button className="md-ghost md-ghost-quiet" type="button" onClick={() => setRevealed(false)}>Hide</button>
+            )}
+          </>
+        )}
+      </div>
+    </>
+  );
+}
+
+function Callout({ kind, checkIndex, children }: { kind: string; checkIndex?: number; children: React.ReactNode }) {
+  const info = CALLOUTS[kind] ?? { label: kind.charAt(0) + kind.slice(1).toLowerCase(), tone: "slate" };
+  return (
+    <aside className="md-callout" data-kind={kind} style={{ ["--c" as string]: `var(--${info.tone})`, ["--ct" as string]: `var(--${info.tone}-tint)` }}>
+      <div className="md-callout-head">
+        <span className="course-rule" aria-hidden="true" />
+        <span className="eyebrow">{info.label}</span>
+      </div>
+      {kind === "CHECK" && checkIndex !== undefined ? (
+        <CheckCallout index={checkIndex}>{children}</CheckCallout>
+      ) : (
+        <div className="md-callout-content">{children}</div>
       )}
     </aside>
   );
 }
 
 function CodeBlock({ children }: { children: React.ReactNode }) {
+  const [copied, setCopied] = useState(false);
   const code = React.Children.only(children) as React.ReactElement<{ className?: string; children?: React.ReactNode }>;
   const language = /language-([\w+-]+)/.exec(code.props.className ?? "")?.[1];
   const source = String(code.props.children ?? "").replace(/\n$/, "");
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(source);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1400);
+    } catch {
+      /* Clipboard can be blocked; the code is still selectable. */
+    }
+  };
   return (
     <div className="md-code-block">
-      {language && <span className="md-code-language">{language}</span>}
+      <div className="md-code-head">
+        <span className="eyebrow">{language ?? "code"}</span>
+        <button type="button" className="md-code-copy" onClick={copy}>{copied ? "Copied" : "Copy"}</button>
+      </div>
       <SyntaxHighlighter language={language ?? "text"} useInlineStyles={false} PreTag="pre" CodeTag="code">
         {source}
       </SyntaxHighlighter>
@@ -166,11 +226,21 @@ function CodeBlock({ children }: { children: React.ReactNode }) {
   );
 }
 
-const ReaderContext = createContext<{
+type ReaderContextValue = {
   collapsedSections: Set<string>;
   onToggleSection: (id: string) => void;
   headings: MarkdownHeading[];
-}>({ collapsedSections: new Set(), onToggleSection: () => {}, headings: [] });
+  checks: Record<string, CheckResult>;
+  onMarkCheck: (id: string, result: CheckResult) => void;
+};
+
+const ReaderContext = createContext<ReaderContextValue>({
+  collapsedSections: new Set(),
+  onToggleSection: () => {},
+  headings: [],
+  checks: {},
+  onMarkCheck: () => {},
+});
 
 const readerComponents: Components = {
   section: function Section({ node, children, ...props }) {
@@ -183,7 +253,7 @@ const readerComponents: Components = {
       <section {...props} data-reader-section="" data-collapsed={collapsed}>
         {React.isValidElement(heading) ? React.cloneElement(heading as React.ReactElement<{ children?: React.ReactNode }>, {},
           <button className="md-section-toggle" type="button" onClick={() => onToggleSection(id)} aria-expanded={!collapsed} aria-label={`${collapsed ? "Expand" : "Collapse"} ${headings.find((item) => item.id === id)?.text ?? "section"}`}>
-            <span className="md-section-chevron" aria-hidden="true">⌄</span>
+            <svg className="md-section-chevron" aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6" /></svg>
             {heading.props.children}
           </button>
         ) : heading}
@@ -193,22 +263,34 @@ const readerComponents: Components = {
   },
   blockquote({ node, children, ...props }) {
     const kind = node?.properties?.["data-callout"];
-    return kind ? <Callout kind={String(kind)}>{children}</Callout> : <blockquote {...props}>{children}</blockquote>;
+    const check = node?.properties?.["data-check"];
+    return kind ? (
+      <Callout kind={String(kind)} checkIndex={check === undefined ? undefined : Number(check)}>{children}</Callout>
+    ) : (
+      <blockquote {...props}>{children}</blockquote>
+    );
+  },
+  a({ node, href, children, ...props }) {
+    void node;
+    const external = href ? /^https?:\/\//.test(href) : false;
+    return <a href={href} {...props} {...(external ? { target: "_blank", rel: "noreferrer" } : {})}>{children}</a>;
   },
   pre({ children }) { return <CodeBlock>{children}</CodeBlock>; },
   table({ children, ...props }) { return <div className="md-table-scroll" tabIndex={0} role="region" aria-label="Scrollable table"><table {...props}>{children}</table></div>; },
 };
 
-export function MarkdownReader({ markdown, collapsedSections, onToggleSection }: {
+export function MarkdownReader({ markdown, collapsedSections, onToggleSection, checks = {}, onMarkCheck = () => {} }: {
   markdown: string;
   collapsedSections: Set<string>;
   onToggleSection: (id: string) => void;
+  checks?: Record<string, CheckResult>;
+  onMarkCheck?: (id: string, result: CheckResult) => void;
 }) {
   const headings = useMemo(() => getMarkdownHeadings(markdown), [markdown]);
   const plugins = useMemo(() => [remarkGfm, remarkMath, remarkReader(headings)], [headings]);
 
   return (
-    <ReaderContext.Provider value={{ collapsedSections, onToggleSection, headings }}>
+    <ReaderContext.Provider value={{ collapsedSections, onToggleSection, headings, checks, onMarkCheck }}>
     <article className="markdown-body">
       <ReactMarkdown
         remarkPlugins={plugins}
@@ -220,4 +302,15 @@ export function MarkdownReader({ markdown, collapsedSections, onToggleSection }:
     </article>
     </ReaderContext.Provider>
   );
+}
+
+/** How many "Check yourself" callouts a note holds, skipping fenced code. */
+export function countChecks(markdown: string) {
+  let fence = false;
+  let count = 0;
+  for (const line of markdown.split(/\r?\n/)) {
+    if (/^ {0,3}(`{3,}|~{3,})/.test(line)) fence = !fence;
+    else if (!fence && /^ {0,3}>\s*\[!CHECK\]/i.test(line)) count++;
+  }
+  return count;
 }
